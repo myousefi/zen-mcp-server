@@ -272,7 +272,7 @@ class OpenAICompatibleProvider(ModelProvider):
         max_output_tokens: Optional[int] = None,
         **kwargs,
     ) -> ModelResponse:
-        """Generate content using the /v1/responses endpoint for o3-pro via OpenAI library."""
+        """Generate content using the /v1/responses endpoint for reasoning models (O3, O3-mini, O3-pro, O4-mini)."""
         # Convert messages to the correct format for responses endpoint
         input_messages = []
 
@@ -281,7 +281,7 @@ class OpenAICompatibleProvider(ModelProvider):
             content = message.get("content", "")
 
             if role == "system":
-                # For o3-pro, system messages should be handled carefully to avoid policy violations
+                # For reasoning models, system messages should be handled carefully to avoid policy violations
                 # Instead of prefixing with "System:", we'll include the system content naturally
                 input_messages.append({"role": "user", "content": [{"type": "input_text", "text": content}]})
             elif role == "user":
@@ -297,6 +297,14 @@ class OpenAICompatibleProvider(ModelProvider):
             "reasoning": {"effort": "medium"},  # Use nested object for responses endpoint
             "store": True,
         }
+
+        # Add web search tool if enabled via environment variable
+        import os
+
+        if os.getenv("OPENAI_ENABLE_WEB_SEARCH", "").lower() in ["true", "1", "yes", "on"]:
+            completion_params["tools"] = [{"type": "web_search_preview"}]
+            # Optional: Force web search for better consistency
+            # completion_params["tool_choice"] = {"type": "web_search_preview"}
 
         # Add max tokens if specified (using max_completion_tokens for responses endpoint)
         if max_output_tokens:
@@ -324,8 +332,34 @@ class OpenAICompatibleProvider(ModelProvider):
                 # Extract content and usage from responses endpoint format
                 # The response format is different for responses endpoint
                 content = ""
+                web_search_info = None
+
+                # Check if response includes web search results
                 if hasattr(response, "output") and response.output:
-                    if hasattr(response.output, "content") and response.output.content:
+                    # Handle web search response format with multiple outputs
+                    if isinstance(response.output, list):
+                        for output_item in response.output:
+                            if hasattr(output_item, "type"):
+                                if output_item.type == "web_search_call":
+                                    # Track web search call info
+                                    web_search_info = {
+                                        "id": getattr(output_item, "id", ""),
+                                        "status": getattr(output_item, "status", ""),
+                                    }
+                                elif output_item.type == "message":
+                                    # Extract text from message output
+                                    if hasattr(output_item, "content") and output_item.content:
+                                        for content_item in output_item.content:
+                                            if hasattr(content_item, "type") and content_item.type == "output_text":
+                                                content = content_item.text
+                                                # Also capture any annotations (citations)
+                                                if hasattr(content_item, "annotations"):
+                                                    if not web_search_info:
+                                                        web_search_info = {}
+                                                    web_search_info["citations"] = content_item.annotations
+                                                break
+                    # Handle standard response format
+                    elif hasattr(response.output, "content") and response.output.content:
                         # Look for output_text in content
                         for content_item in response.output.content:
                             if hasattr(content_item, "type") and content_item.type == "output_text":
@@ -348,18 +382,25 @@ class OpenAICompatibleProvider(ModelProvider):
                         "total_tokens": input_tokens + output_tokens,
                     }
 
+                # Build metadata
+                metadata = {
+                    "model": getattr(response, "model", model_name),
+                    "id": getattr(response, "id", ""),
+                    "created": getattr(response, "created_at", 0),
+                    "endpoint": "responses",
+                }
+
+                # Add web search info to metadata if present
+                if web_search_info:
+                    metadata["web_search"] = web_search_info
+
                 return ModelResponse(
                     content=content,
                     usage=usage,
                     model_name=model_name,
                     friendly_name=self.FRIENDLY_NAME,
                     provider=self.get_provider_type(),
-                    metadata={
-                        "model": getattr(response, "model", model_name),
-                        "id": getattr(response, "id", ""),
-                        "created": getattr(response, "created_at", 0),
-                        "endpoint": "responses",
-                    },
+                    metadata=metadata,
                 )
 
             except Exception as e:
@@ -371,7 +412,7 @@ class OpenAICompatibleProvider(ModelProvider):
                 if is_retryable and attempt < max_retries - 1:
                     delay = retry_delays[attempt]
                     logging.warning(
-                        f"Retryable error for o3-pro responses endpoint, attempt {attempt + 1}/{max_retries}: {str(e)}. Retrying in {delay}s..."
+                        f"Retryable error for reasoning model responses endpoint, attempt {attempt + 1}/{max_retries}: {str(e)}. Retrying in {delay}s..."
                     )
                     time.sleep(delay)
                 else:
@@ -379,7 +420,7 @@ class OpenAICompatibleProvider(ModelProvider):
 
         # If we get here, all retries failed
         actual_attempts = attempt + 1  # Convert from 0-based index to human-readable count
-        error_msg = f"o3-pro responses endpoint error after {actual_attempts} attempt{'s' if actual_attempts > 1 else ''}: {str(last_exception)}"
+        error_msg = f"Reasoning model responses endpoint error after {actual_attempts} attempt{'s' if actual_attempts > 1 else ''}: {str(last_exception)}"
         logging.error(error_msg)
         raise RuntimeError(error_msg) from last_exception
 
@@ -480,9 +521,11 @@ class OpenAICompatibleProvider(ModelProvider):
                     continue  # Skip unsupported parameters for reasoning models
                 completion_params[key] = value
 
-        # Check if this is o3-pro and needs the responses endpoint
-        if resolved_model == "o3-pro-2025-06-10":
-            # This model requires the /v1/responses endpoint
+        # Check if this is a reasoning model that needs the responses endpoint
+        # O3, O3-mini, O3-pro, and O4-mini all use the responses endpoint
+        reasoning_models = ["o3", "o3-mini", "o3-pro-2025-06-10", "o4-mini"]
+        if resolved_model in reasoning_models:
+            # These models require the /v1/responses endpoint
             # If it fails, we should not fall back to chat/completions
             return self._generate_with_responses_endpoint(
                 model_name=resolved_model,
